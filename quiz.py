@@ -1,8 +1,12 @@
+import os
 import random
 import re
 import streamlit as st
 
 st.set_page_config(page_title="1問1答クイズ", page_icon="📝", layout="centered")
+
+# リポジトリに同梱しておく問題ファイル名
+DEFAULT_QUESTIONS_FILE = "questions.txt"
 
 
 # ─── パーサー（元のコードから変更なし） ────────────────────────────────────
@@ -126,7 +130,24 @@ def reset_quiz():
     init_state()
 
 
+def try_autoload_default_questions():
+    """リポジトリ同梱の questions.txt があれば自動で読み込んですぐ出題開始する"""
+    if st.session_state.questions is not None:
+        return
+    if not os.path.exists(DEFAULT_QUESTIONS_FILE):
+        return
+    with open(DEFAULT_QUESTIONS_FILE, encoding="utf-8") as f:
+        raw = f.read()
+    questions = load_questions_from_text(raw)
+    if not questions:
+        return
+    random.shuffle(questions)
+    st.session_state.questions = questions
+    st.session_state.phase = "question"
+
+
 init_state()
+try_autoload_default_questions()
 
 
 # ─── 画面: アップロード ───────────────────────────────────────────────────
@@ -258,6 +279,26 @@ def screen_final():
     if st.button("もう一度挑戦する", type="primary"):
         reset_quiz()
         st.rerun()
+
+
+# ─── サイドバー: 別ファイルで試したいとき用 ──────────────────────────────
+
+with st.sidebar:
+    st.markdown("### 別の問題ファイルで試す")
+    override = st.file_uploader("問題ファイル(.txt)を差し替え", type=["txt"], key="override_uploader")
+    if override is not None:
+        raw = override.read().decode("utf-8")
+        questions = load_questions_from_text(raw)
+        if questions:
+            random.shuffle(questions)
+            st.session_state.questions = questions
+            st.session_state.index = 0
+            st.session_state.correct_count = 0
+            st.session_state.answered = 0
+            st.session_state.phase = "question"
+            st.rerun()
+        else:
+            st.error("問題が読み込めませんでした。")
 
 
 # ─── メイン ──────────────────────────────────────────────────────────────
