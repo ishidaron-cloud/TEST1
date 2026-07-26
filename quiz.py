@@ -1,3 +1,5 @@
+import hashlib
+import json
 import os
 import random
 import re
@@ -7,6 +9,12 @@ st.set_page_config(page_title="1問1答クイズ", page_icon="📝", layout="cen
 
 # リポジトリに同梱しておく問題ファイル名
 DEFAULT_QUESTIONS_FILE = "questions.txt"
+
+# 間違えた問題の履歴を保存するファイル
+WRONG_HISTORY_FILE = "wrong_answers.json"
+
+# 1セットあたりの出題数
+BATCH_SIZE = 30
 
 
 # ─── パーサー（元のコードから変更なし） ────────────────────────────────────
@@ -106,17 +114,41 @@ def load_questions_from_text(raw):
     return parse_original_format(raw)
 
 
+# ─── 間違えた問題の履歴（前回間違えましたマーク用） ──────────────────────
+
+def question_hash(q):
+    return hashlib.md5(q["question"].encode("utf-8")).hexdigest()
+
+
+def load_wrong_history():
+    if not os.path.exists(WRONG_HISTORY_FILE):
+        return set()
+    try:
+        with open(WRONG_HISTORY_FILE, encoding="utf-8") as f:
+            return set(json.load(f))
+    except (json.JSONDecodeError, OSError):
+        return set()
+
+
+def save_wrong_history(wrong_set):
+    with open(WRONG_HISTORY_FILE, "w", encoding="utf-8") as f:
+        json.dump(sorted(wrong_set), f, ensure_ascii=False, indent=2)
+
+
 # ─── セッション状態の初期化 ─────────────────────────────────────────────
 
 def init_state():
     defaults = {
         "questions": None,
-        "index": 0,          # 0-indexed, 現在の問題番号
-        "correct_count": 0,
-        "answered": 0,
-        "phase": "upload",   # upload -> question -> result -> final
+        "index": 0,           # questions 配列全体での現在位置（0-indexed）
+        "batch_index": 0,     # 現在何セット目か（0-indexed）
+        "correct_count": 0,   # 現在のセットでの正解数
+        "answered": 0,        # 現在のセットでの回答数
+        "phase": "upload",    # upload -> question -> result -> final
         "user_ans": None,
         "selected_radio": None,
+        "wrong_history_snapshot": set(),  # このセット開始時点の「前回間違えた問題」
+        "wrong_history_current": set(),   # 今回の履歴（都度ディスクへ保存）
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -124,10 +156,39 @@ def init_state():
 
 
 def reset_quiz():
-    for k in ["questions", "index", "correct_count", "answered", "phase", "user_ans", "selected_radio"]:
+    for k in [
+        "questions", "index", "batch_index", "correct_count", "answered",
+        "phase", "user_ans", "selected_radio",
+        "wrong_history_snapshot", "wrong_history_current",
+    ]:
         if k in st.session_state:
             del st.session_state[k]
     init_state()
+
+
+def start_quiz(questions):
+    random.shuffle(questions)
+    st.session_state.questions = questions
+    st.session_state.index = 0
+    st.session_state.batch_index = 0
+    st.session_state.correct_count = 0
+    st.session_state.answered = 0
+    st.session_state.phase = "question"
+    snapshot = load_wrong_history()
+    st.session_state.wrong_history_snapshot = snapshot
+    st.session_state.wrong_history_current = set(snapshot)
+
+
+def total_batches():
+    total = len(st.session_state.questions)
+    return -(-total // BATCH_SIZE)  # ceil division
+
+
+def current_batch_bounds():
+    total = len(st.session_state.questions)
+    start = st.session_state.batch_index * BATCH_SIZE
+    end = min(start + BATCH_SIZE, total)
+    return start, end
 
 
 def try_autoload_default_questions():
@@ -141,9 +202,7 @@ def try_autoload_default_questions():
     questions = load_questions_from_text(raw)
     if not questions:
         return
-    random.shuffle(questions)
-    st.session_state.questions = questions
-    st.session_state.phase = "question"
+    start_quiz(questions)
 
 
 init_state()
@@ -155,6 +214,7 @@ try_autoload_default_questions()
 def screen_upload():
     st.title("📝 1問1答クイズ")
     st.write("問題ファイル（.txt）をアップロードしてください。")
+    st.caption(f"※ {BATCH_SIZE}問ずつのセットに分けて出題されます。")
 
     uploaded = st.file_uploader("問題ファイルを選択", type=["txt"])
 
@@ -166,9 +226,7 @@ def screen_upload():
             st.error("問題が読み込めませんでした。ファイルの形式を確認してください。")
             return
 
-        random.shuffle(questions)
-        st.session_state.questions = questions
-        st.session_state.phase = "question"
+        start_quiz(questions)
         st.rerun()
 
     with st.expander("対応しているファイル形式を見る"):
@@ -189,16 +247,24 @@ def screen_upload():
 
 def screen_question():
     questions = st.session_state.questions
-    total = len(questions)
+    batch_start, batch_end = current_batch_bounds()
+    batch_total = batch_end - batch_start
     index = st.session_state.index
+    local_index = index - batch_start
     q = questions[index]
 
-    st.progress(index / total, text=f"{index}/{total} 問")
-    st.subheader(f"問題 {index + 1}")
+    st.progress(
+        local_index / batch_total,
+        text=f"第{st.session_state.batch_index + 1}/{total_batches()}セット　{local_index}/{batch_total} 問",
+    )
+    st.subheader(f"問題 {local_index + 1}")
+
+    if question_hash(q) in st.session_state.wrong_history_snapshot:
+        st.warning("⚠️ 前回間違えました")
+
     st.write(q["question"])
 
     keys = sorted(q["choices"].keys())
-    labels = [f"{k}. {q['choices'][k]}" for k in keys]
 
     choice = st.radio(
         "選択肢",
@@ -211,8 +277,15 @@ def screen_question():
     if st.button("回答する", type="primary", disabled=(choice is None)):
         st.session_state.user_ans = choice
         st.session_state.answered += 1
+
+        q_hash = question_hash(q)
         if choice == q["answer"]:
             st.session_state.correct_count += 1
+            st.session_state.wrong_history_current.discard(q_hash)
+        else:
+            st.session_state.wrong_history_current.add(q_hash)
+        save_wrong_history(st.session_state.wrong_history_current)
+
         st.session_state.phase = "result"
         st.rerun()
 
@@ -221,7 +294,7 @@ def screen_question():
 
 def screen_result():
     questions = st.session_state.questions
-    total = len(questions)
+    _, batch_end = current_batch_bounds()
     index = st.session_state.index
     q = questions[index]
     user_ans = st.session_state.user_ans
@@ -243,11 +316,11 @@ def screen_result():
             st.markdown("**解説**")
             st.write(exp)
 
-    is_last = index + 1 >= total
-    button_label = "結果を見る" if is_last else "次の問題へ"
+    is_last_in_batch = index + 1 >= batch_end
+    button_label = "結果を見る" if is_last_in_batch else "次の問題へ"
 
     if st.button(button_label, type="primary"):
-        if is_last:
+        if is_last_in_batch:
             st.session_state.phase = "final"
         else:
             st.session_state.index += 1
@@ -255,14 +328,16 @@ def screen_result():
         st.rerun()
 
 
-# ─── 画面: 最終結果 ───────────────────────────────────────────────────────
+# ─── 画面: セット結果 / 最終結果 ──────────────────────────────────────────
 
 def screen_final():
     correct_count = st.session_state.correct_count
     answered = st.session_state.answered
     rate = correct_count / answered * 100 if answered > 0 else 0
 
-    st.title("🏁 クイズ終了！")
+    is_last_batch = (st.session_state.batch_index + 1) >= total_batches()
+
+    st.title("🏁 クイズ終了！" if is_last_batch else f"✅ 第{st.session_state.batch_index + 1}セット終了！")
     st.metric("正解数", f"{correct_count} / {answered}")
     st.progress(rate / 100, text=f"正答率 {rate:.1f}%")
 
@@ -276,9 +351,18 @@ def screen_final():
     else:
         st.warning("💪 もう一度チャレンジしてみましょう！")
 
-    if st.button("もう一度挑戦する", type="primary"):
-        reset_quiz()
-        st.rerun()
+    if is_last_batch:
+        if st.button("もう一度挑戦する", type="primary"):
+            reset_quiz()
+            st.rerun()
+    else:
+        if st.button(f"次の{BATCH_SIZE}問へ", type="primary"):
+            st.session_state.batch_index += 1
+            st.session_state.index = st.session_state.batch_index * BATCH_SIZE
+            st.session_state.correct_count = 0
+            st.session_state.answered = 0
+            st.session_state.phase = "question"
+            st.rerun()
 
 
 # ─── サイドバー: 別ファイルで試したいとき用 ──────────────────────────────
@@ -290,12 +374,7 @@ with st.sidebar:
         raw = override.read().decode("utf-8")
         questions = load_questions_from_text(raw)
         if questions:
-            random.shuffle(questions)
-            st.session_state.questions = questions
-            st.session_state.index = 0
-            st.session_state.correct_count = 0
-            st.session_state.answered = 0
-            st.session_state.phase = "question"
+            start_quiz(questions)
             st.rerun()
         else:
             st.error("問題が読み込めませんでした。")
