@@ -13,11 +13,14 @@ DEFAULT_QUESTIONS_FILE = "questions.txt"
 # 間違えた問題の履歴を保存するファイル
 WRONG_HISTORY_FILE = "wrong_answers.json"
 
+# 進行状況(リロード対策)を保存するファイル
+SESSION_FILE = "session_progress.json"
+
 # 1セットあたりの出題数
 BATCH_SIZE = 30
 
 
-# ─── パーサー（元のコードから変更なし） ────────────────────────────────────
+# ─── パーサー(元のコードから変更なし) ────────────────────────────────────
 
 def parse_original_format(raw):
     questions = []
@@ -114,7 +117,7 @@ def load_questions_from_text(raw):
     return parse_original_format(raw)
 
 
-# ─── 間違えた問題の履歴（前回間違えましたマーク用） ──────────────────────
+# ─── 間違えた問題の履歴(前回間違えましたマーク用) ──────────────────────
 
 def question_hash(q):
     return hashlib.md5(q["question"].encode("utf-8")).hexdigest()
@@ -135,20 +138,61 @@ def save_wrong_history(wrong_set):
         json.dump(sorted(wrong_set), f, ensure_ascii=False, indent=2)
 
 
+# ─── 進行状況の保存/復元(ページリロード対策) ──────────────────────────
+
+def save_progress():
+    if st.session_state.get("questions") is None:
+        return
+    data = {
+        "questions": st.session_state.questions,
+        "index": st.session_state.index,
+        "batch_index": st.session_state.batch_index,
+        "correct_count": st.session_state.correct_count,
+        "answered": st.session_state.answered,
+        "phase": st.session_state.phase,
+        "user_ans": st.session_state.user_ans,
+        "wrong_history_snapshot": sorted(st.session_state.wrong_history_snapshot),
+        "wrong_history_current": sorted(st.session_state.wrong_history_current),
+    }
+    with open(SESSION_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+
+
+def load_progress():
+    if not os.path.exists(SESSION_FILE):
+        return None
+    try:
+        with open(SESSION_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        data["wrong_history_snapshot"] = set(data.get("wrong_history_snapshot", []))
+        data["wrong_history_current"] = set(data.get("wrong_history_current", []))
+        return data
+    except (json.JSONDecodeError, OSError, KeyError):
+        return None
+
+
+def clear_progress():
+    if os.path.exists(SESSION_FILE):
+        try:
+            os.remove(SESSION_FILE)
+        except OSError:
+            pass
+
+
 # ─── セッション状態の初期化 ─────────────────────────────────────────────
 
 def init_state():
     defaults = {
         "questions": None,
-        "index": 0,           # questions 配列全体での現在位置（0-indexed）
-        "batch_index": 0,     # 現在何セット目か（0-indexed）
+        "index": 0,           # questions 配列全体での現在位置(0-indexed)
+        "batch_index": 0,     # 現在何セット目か(0-indexed)
         "correct_count": 0,   # 現在のセットでの正解数
         "answered": 0,        # 現在のセットでの回答数
         "phase": "upload",    # upload -> question -> result -> final
         "user_ans": None,
         "selected_radio": None,
         "wrong_history_snapshot": set(),  # このセット開始時点の「前回間違えた問題」
-        "wrong_history_current": set(),   # 今回の履歴（都度ディスクへ保存）
+        "wrong_history_current": set(),   # 今回の履歴(都度ディスクへ保存)
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -156,6 +200,7 @@ def init_state():
 
 
 def reset_quiz():
+    clear_progress()
     for k in [
         "questions", "index", "batch_index", "correct_count", "answered",
         "phase", "user_ans", "selected_radio",
@@ -206,14 +251,21 @@ def try_autoload_default_questions():
 
 
 init_state()
-try_autoload_default_questions()
+
+if st.session_state.questions is None:
+    _progress = load_progress()
+    if _progress is not None:
+        for _k, _v in _progress.items():
+            st.session_state[_k] = _v
+    else:
+        try_autoload_default_questions()
 
 
 # ─── 画面: アップロード ───────────────────────────────────────────────────
 
 def screen_upload():
     st.title("📝 1問1答クイズ")
-    st.write("問題ファイル（.txt）をアップロードしてください。")
+    st.write("問題ファイル(.txt)をアップロードしてください。")
     st.caption(f"※ {BATCH_SIZE}問ずつのセットに分けて出題されます。")
 
     uploaded = st.file_uploader("問題ファイルを選択", type=["txt"])
@@ -227,18 +279,19 @@ def screen_upload():
             return
 
         start_quiz(questions)
+        save_progress()
         st.rerun()
 
     with st.expander("対応しているファイル形式を見る"):
         st.code(
-            "Q: 日本の首都は？\n"
+            "Q: 日本の首都は?\n"
             "A: 大阪\n"
             "B: 東京\n"
             "C: 名古屋\n"
             "ANS: B\n"
             "EXP: 東京は日本の首都です。\n"
             "---\n"
-            "（次の問題も同じ形式で続ける）",
+            "(次の問題も同じ形式で続ける)",
             language="text",
         )
 
@@ -287,6 +340,7 @@ def screen_question():
         save_wrong_history(st.session_state.wrong_history_current)
 
         st.session_state.phase = "result"
+        save_progress()
         st.rerun()
 
 
@@ -325,6 +379,7 @@ def screen_result():
         else:
             st.session_state.index += 1
             st.session_state.phase = "question"
+        save_progress()
         st.rerun()
 
 
@@ -362,6 +417,7 @@ def screen_final():
             st.session_state.correct_count = 0
             st.session_state.answered = 0
             st.session_state.phase = "question"
+            save_progress()
             st.rerun()
 
 
@@ -375,6 +431,7 @@ with st.sidebar:
         questions = load_questions_from_text(raw)
         if questions:
             start_quiz(questions)
+            save_progress()
             st.rerun()
         else:
             st.error("問題が読み込めませんでした。")
