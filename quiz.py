@@ -10,11 +10,17 @@ st.set_page_config(page_title="1問1答クイズ", page_icon="📝", layout="cen
 # リポジトリに同梱しておく問題ファイル名
 DEFAULT_QUESTIONS_FILE = "questions.txt"
 
-# 間違えた問題の履歴を保存するファイル
+# 間違えた問題の履歴を保存するファイル(直前セットで間違えた問題の警告表示用)
 WRONG_HISTORY_FILE = "wrong_answers.json"
 
 # 進行状況(リロード対策)を保存するファイル
 SESSION_FILE = "session_progress.json"
+
+# 問題ごとの習熟度(連続正解スコア)を保存するファイル
+MASTERY_FILE = "question_mastery.json"
+
+# このスコア以上になったら「卒業」とみなし、苦手克服モードの出題プールから除外する
+MASTERY_THRESHOLD = 3
 
 # 1セットあたりの出題数
 BATCH_SIZE = 30
@@ -138,12 +144,49 @@ def save_wrong_history(wrong_set):
         json.dump(sorted(wrong_set), f, ensure_ascii=False, indent=2)
 
 
+# ─── 問題ごとの習熟度スコア(苦手克服モードの出題プール判定用) ───────────
+
+def load_mastery():
+    if not os.path.exists(MASTERY_FILE):
+        return {}
+    try:
+        with open(MASTERY_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_mastery(mastery):
+    with open(MASTERY_FILE, "w", encoding="utf-8") as f:
+        json.dump(mastery, f, ensure_ascii=False, indent=2)
+
+
+def update_mastery(q, correct):
+    """正解なら+1、不正解なら-1。モードを問わず毎回この記録を更新する。"""
+    mastery = load_mastery()
+    h = question_hash(q)
+    score = mastery.get(h, 0) + (1 if correct else -1)
+    mastery[h] = score
+    save_mastery(mastery)
+    return score
+
+
+def filter_pool_for_mode(all_questions, mode):
+    """苦手克服モードでは、卒業基準(MASTERY_THRESHOLD)に達した問題を出題プールから除外する。"""
+    if mode != "weak":
+        return list(all_questions)
+    mastery = load_mastery()
+    return [q for q in all_questions if mastery.get(question_hash(q), 0) < MASTERY_THRESHOLD]
+
+
 # ─── 進行状況の保存/復元(ページリロード対策) ──────────────────────────
 
 def save_progress():
     if st.session_state.get("questions") is None:
         return
     data = {
+        "all_questions": st.session_state.all_questions,
+        "mode": st.session_state.mode,
         "questions": st.session_state.questions,
         "index": st.session_state.index,
         "batch_index": st.session_state.batch_index,
@@ -183,12 +226,14 @@ def clear_progress():
 
 def init_state():
     defaults = {
-        "questions": None,
-        "index": 0,           # questions 配列全体での現在位置(0-indexed)
-        "batch_index": 0,     # 現在何セット目か(0-indexed)
-        "correct_count": 0,   # 現在のセットでの正解数
-        "answered": 0,        # 現在のセットでの回答数
-        "phase": "upload",    # upload -> question -> result -> final
+        "all_questions": None,  # アップロードされた全問題(フィルタ前・モード切替の元データ)
+        "mode": "normal",       # normal(全問) / weak(苦手克服)
+        "questions": None,      # 今回出題する問題(シャッフル・フィルタ後)
+        "index": 0,             # questions 配列全体での現在位置(0-indexed)
+        "batch_index": 0,       # 現在何セット目か(0-indexed)
+        "correct_count": 0,     # 現在のセットでの正解数
+        "answered": 0,          # 現在のセットでの回答数
+        "phase": "upload",      # upload -> question -> result -> final / mastered
         "user_ans": None,
         "selected_radio": None,
         "wrong_history_snapshot": set(),  # このセット開始時点の「前回間違えた問題」
@@ -202,8 +247,8 @@ def init_state():
 def reset_quiz():
     clear_progress()
     for k in [
-        "questions", "index", "batch_index", "correct_count", "answered",
-        "phase", "user_ans", "selected_radio",
+        "all_questions", "mode", "questions", "index", "batch_index",
+        "correct_count", "answered", "phase", "user_ans", "selected_radio",
         "wrong_history_snapshot", "wrong_history_current",
     ]:
         if k in st.session_state:
@@ -211,9 +256,20 @@ def reset_quiz():
     init_state()
 
 
-def start_quiz(questions):
-    random.shuffle(questions)
-    st.session_state.questions = questions
+def start_quiz(all_questions, mode="normal"):
+    st.session_state.all_questions = all_questions
+    st.session_state.mode = mode
+
+    pool = filter_pool_for_mode(all_questions, mode)
+
+    if not pool:
+        # 苦手克服モード対象の問題が1問も残っていない(全問卒業済み)
+        st.session_state.questions = []
+        st.session_state.phase = "mastered"
+        return
+
+    random.shuffle(pool)
+    st.session_state.questions = pool
     st.session_state.index = 0
     st.session_state.batch_index = 0
     st.session_state.correct_count = 0
@@ -237,7 +293,7 @@ def current_batch_bounds():
 
 
 def try_autoload_default_questions():
-    """リポジトリ同梱の questions.txt があれば自動で読み込んですぐ出題開始する"""
+    """リポジトリ同梱の questions.txt があれば自動で読み込んですぐ出題開始する(通常モード)"""
     if st.session_state.questions is not None:
         return
     if not os.path.exists(DEFAULT_QUESTIONS_FILE):
@@ -247,7 +303,7 @@ def try_autoload_default_questions():
     questions = load_questions_from_text(raw)
     if not questions:
         return
-    start_quiz(questions)
+    start_quiz(questions, "normal")
 
 
 init_state()
@@ -261,12 +317,25 @@ if st.session_state.questions is None:
         try_autoload_default_questions()
 
 
+MODE_LABELS = {
+    "normal": "通常モード(全問)",
+    "weak": f"苦手克服モード(連続正解{MASTERY_THRESHOLD}回で卒業)",
+}
+
+
 # ─── 画面: アップロード ───────────────────────────────────────────────────
 
 def screen_upload():
     st.title("📝 1問1答クイズ")
     st.write("問題ファイル(.txt)をアップロードしてください。")
     st.caption(f"※ {BATCH_SIZE}問ずつのセットに分けて出題されます。")
+
+    mode = st.radio(
+        "出題モード",
+        options=["normal", "weak"],
+        format_func=lambda m: MODE_LABELS[m],
+        horizontal=True,
+    )
 
     uploaded = st.file_uploader("問題ファイルを選択", type=["txt"])
 
@@ -278,7 +347,7 @@ def screen_upload():
             st.error("問題が読み込めませんでした。ファイルの形式を確認してください。")
             return
 
-        start_quiz(questions)
+        start_quiz(questions, mode)
         save_progress()
         st.rerun()
 
@@ -310,10 +379,15 @@ def screen_question():
         local_index / batch_total,
         text=f"第{st.session_state.batch_index + 1}/{total_batches()}セット　{local_index}/{batch_total} 問",
     )
+    st.caption(MODE_LABELS.get(st.session_state.mode, "通常モード"))
     st.subheader(f"問題 {local_index + 1}")
 
     if question_hash(q) in st.session_state.wrong_history_snapshot:
         st.warning("⚠️ 前回間違えました")
+
+    if st.session_state.mode == "weak":
+        score = load_mastery().get(question_hash(q), 0)
+        st.caption(f"連続正解カウント: {score}/{MASTERY_THRESHOLD}(到達で卒業)")
 
     st.write(q["question"])
 
@@ -332,12 +406,14 @@ def screen_question():
         st.session_state.answered += 1
 
         q_hash = question_hash(q)
-        if choice == q["answer"]:
+        is_correct = choice == q["answer"]
+        if is_correct:
             st.session_state.correct_count += 1
             st.session_state.wrong_history_current.discard(q_hash)
         else:
             st.session_state.wrong_history_current.add(q_hash)
         save_wrong_history(st.session_state.wrong_history_current)
+        update_mastery(q, is_correct)
 
         st.session_state.phase = "result"
         save_progress()
@@ -421,16 +497,50 @@ def screen_final():
             st.rerun()
 
 
-# ─── サイドバー: 別ファイルで試したいとき用 ──────────────────────────────
+# ─── 画面: 苦手克服モード対象が全問卒業済み ──────────────────────────────
+
+def screen_mastered():
+    st.title("🎓 全問マスター！")
+    st.success(f"苦手克服モード対象の問題は、すべて卒業基準(連続正解{MASTERY_THRESHOLD}回)を満たしています。")
+    st.write("通常モードで復習を続けるか、最初からやり直せます。")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("通常モードで復習する", type="primary"):
+            start_quiz(st.session_state.all_questions, "normal")
+            save_progress()
+            st.rerun()
+    with col2:
+        if st.button("最初からやり直す"):
+            reset_quiz()
+            st.rerun()
+
+
+# ─── サイドバー: モード切替 / 別ファイルで試したいとき用 ─────────────────
 
 with st.sidebar:
+    st.markdown("### 出題モード")
+    current_mode = st.session_state.get("mode", "normal")
+    mode_choice = st.radio(
+        "モードを選択",
+        options=["normal", "weak"],
+        format_func=lambda m: MODE_LABELS[m],
+        index=0 if current_mode == "normal" else 1,
+        key="sidebar_mode_selector",
+    )
+    if st.session_state.get("all_questions") is not None and mode_choice != current_mode:
+        if st.button("このモードで出題し直す"):
+            start_quiz(st.session_state.all_questions, mode_choice)
+            save_progress()
+            st.rerun()
+
     st.markdown("### 別の問題ファイルで試す")
     override = st.file_uploader("問題ファイル(.txt)を差し替え", type=["txt"], key="override_uploader")
     if override is not None:
         raw = override.read().decode("utf-8")
         questions = load_questions_from_text(raw)
         if questions:
-            start_quiz(questions)
+            start_quiz(questions, mode_choice)
             save_progress()
             st.rerun()
         else:
@@ -449,3 +559,5 @@ elif phase == "result":
     screen_result()
 elif phase == "final":
     screen_final()
+elif phase == "mastered":
+    screen_mastered()
