@@ -233,7 +233,7 @@ def init_state():
         "batch_index": 0,       # 現在何セット目か(0-indexed)
         "correct_count": 0,     # 現在のセットでの正解数
         "answered": 0,          # 現在のセットでの回答数
-        "phase": "upload",      # upload -> question -> result -> final / mastered
+        "phase": "mode_select",  # mode_select -> upload -> question -> result -> final / mastered
         "user_ans": None,
         "selected_radio": None,
         "wrong_history_snapshot": set(),  # このセット開始時点の「前回間違えた問題」
@@ -293,7 +293,7 @@ def current_batch_bounds():
 
 
 def try_autoload_default_questions():
-    """リポジトリ同梱の questions.txt があれば自動で読み込んですぐ出題開始する(通常モード)"""
+    """リポジトリ同梱の questions.txt があれば自動で読み込んですぐ出題開始する(選択済みモードで)"""
     if st.session_state.questions is not None:
         return
     if not os.path.exists(DEFAULT_QUESTIONS_FILE):
@@ -303,7 +303,7 @@ def try_autoload_default_questions():
     questions = load_questions_from_text(raw)
     if not questions:
         return
-    start_quiz(questions, "normal")
+    start_quiz(questions, st.session_state.mode)
 
 
 init_state()
@@ -313,7 +313,7 @@ if st.session_state.questions is None:
     if _progress is not None:
         for _k, _v in _progress.items():
             st.session_state[_k] = _v
-    else:
+    elif st.session_state.phase != "mode_select":
         try_autoload_default_questions()
 
 
@@ -323,19 +323,45 @@ MODE_LABELS = {
 }
 
 
+# ─── 画面: モード選択 ───────────────────────────────────────────────────
+
+def screen_mode_select():
+    st.title("📝 1問1答クイズ")
+    st.write("出題モードを選んでください。")
+    st.caption("※ モードはクイズ開始前にのみ選択できます。開始後に変更したい場合は最初からやり直してください。")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown(f"**{MODE_LABELS['normal']}**")
+        st.caption("すべての問題からランダムに出題します。")
+        if st.button("このモードで始める", key="select_normal", type="primary"):
+            st.session_state.mode = "normal"
+            st.session_state.phase = "upload"
+            try_autoload_default_questions()
+            save_progress()
+            st.rerun()
+    with col2:
+        st.markdown(f"**{MODE_LABELS['weak']}**")
+        st.caption(f"連続正解{MASTERY_THRESHOLD}回に達していない問題だけを繰り返し出題します。")
+        if st.button("このモードで始める", key="select_weak", type="primary"):
+            st.session_state.mode = "weak"
+            st.session_state.phase = "upload"
+            try_autoload_default_questions()
+            save_progress()
+            st.rerun()
+
+
 # ─── 画面: アップロード ───────────────────────────────────────────────────
 
 def screen_upload():
     st.title("📝 1問1答クイズ")
+    st.caption(f"選択中のモード: {MODE_LABELS.get(st.session_state.mode, '')}")
+    if st.button("← モードを選び直す"):
+        st.session_state.phase = "mode_select"
+        st.rerun()
+
     st.write("問題ファイル(.txt)をアップロードしてください。")
     st.caption(f"※ {BATCH_SIZE}問ずつのセットに分けて出題されます。")
-
-    mode = st.radio(
-        "出題モード",
-        options=["normal", "weak"],
-        format_func=lambda m: MODE_LABELS[m],
-        horizontal=True,
-    )
 
     uploaded = st.file_uploader("問題ファイルを選択", type=["txt"])
 
@@ -347,7 +373,7 @@ def screen_upload():
             st.error("問題が読み込めませんでした。ファイルの形式を確認してください。")
             return
 
-        start_quiz(questions, mode)
+        start_quiz(questions, st.session_state.mode)
         save_progress()
         st.rerun()
 
@@ -516,23 +542,15 @@ def screen_mastered():
             st.rerun()
 
 
-# ─── サイドバー: モード切替 / 別ファイルで試したいとき用 ─────────────────
+# ─── サイドバー: 現在のモード表示 / 別ファイルで試したいとき用 ──────────
 
 with st.sidebar:
     st.markdown("### 出題モード")
-    current_mode = st.session_state.get("mode", "normal")
-    mode_choice = st.radio(
-        "モードを選択",
-        options=["normal", "weak"],
-        format_func=lambda m: MODE_LABELS[m],
-        index=0 if current_mode == "normal" else 1,
-        key="sidebar_mode_selector",
-    )
-    if st.session_state.get("all_questions") is not None and mode_choice != current_mode:
-        if st.button("このモードで出題し直す"):
-            start_quiz(st.session_state.all_questions, mode_choice)
-            save_progress()
-            st.rerun()
+    st.caption(MODE_LABELS.get(st.session_state.get("mode", "normal"), ""))
+    st.caption("モードを変更したい場合は、クイズを最初からやり直してください。")
+    if st.button("最初からやり直す(モード選択に戻る)"):
+        reset_quiz()
+        st.rerun()
 
     st.markdown("### 別の問題ファイルで試す")
     override = st.file_uploader("問題ファイル(.txt)を差し替え", type=["txt"], key="override_uploader")
@@ -540,7 +558,7 @@ with st.sidebar:
         raw = override.read().decode("utf-8")
         questions = load_questions_from_text(raw)
         if questions:
-            start_quiz(questions, mode_choice)
+            start_quiz(questions, st.session_state.get("mode", "normal"))
             save_progress()
             st.rerun()
         else:
@@ -551,7 +569,9 @@ with st.sidebar:
 
 phase = st.session_state.phase
 
-if phase == "upload":
+if phase == "mode_select":
+    screen_mode_select()
+elif phase == "upload":
     screen_upload()
 elif phase == "question":
     screen_question()
