@@ -1,3 +1,5 @@
+import hashlib
+import json
 import os
 import random
 import re
@@ -7,6 +9,12 @@ st.set_page_config(page_title="1問1答クイズ", page_icon="📝", layout="cen
 
 # リポジトリに同梱しておく問題ファイル名
 DEFAULT_QUESTIONS_FILE = "questions.txt"
+
+# 苦手克服モード用の永続データ（誤答フラグ・進行中セッション）
+PROGRESS_FILE = "progress.json"
+WEAK_ROUND_SIZE = 30          # 苦手克服モードで一度に出題する問題数
+MASTERED_MIN_ATTEMPTS = 3     # この回数以上解いていて
+MASTERED_ACCURACY = 0.9       # 正答率がこの値以上なら「マスター済み」として出題プールから外す
 
 
 # ─── パーサー（元のコードから変更なし） ────────────────────────────────────
@@ -118,9 +126,103 @@ def load_and_shuffle_questions(raw):
         return questions
     random.shuffle(questions)
     for q in questions:
+        q["qid"] = qid_for(q)
         order = list(q["choices"].keys())
         random.shuffle(order)
         q["choice_order"] = order
+
+    progress = load_progress()
+    register_questions(progress, questions)
+    save_progress(progress)
+
+    return questions
+
+
+# ─── 苦手克服モード: 誤答フラグ・進行中セッションの永続化 ─────────────────
+
+def qid_for(q):
+    """問題文から安定した識別子を作る（ファイルを読み直しても同じ問題は同じID）"""
+    return hashlib.md5(q["question"].encode("utf-8")).hexdigest()[:12]
+
+
+def load_progress():
+    if not os.path.exists(PROGRESS_FILE):
+        return {"bank": {}, "stats": {}, "session": None}
+    try:
+        with open(PROGRESS_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {"bank": {}, "stats": {}, "session": None}
+    data.setdefault("bank", {})
+    data.setdefault("stats", {})
+    data.setdefault("session", None)
+    return data
+
+
+def save_progress(progress):
+    with open(PROGRESS_FILE, "w", encoding="utf-8") as f:
+        json.dump(progress, f, ensure_ascii=False, indent=2)
+
+
+def register_questions(progress, questions):
+    """出題された問題を苦手データのバンクに登録する（既存の誤答記録は保持したまま）"""
+    for q in questions:
+        qid = q["qid"]
+        progress["bank"][qid] = {
+            "question": q["question"],
+            "choices": q["choices"],
+            "answer": q["answer"],
+            "explanation": q.get("explanation", ""),
+        }
+        progress["stats"].setdefault(qid, {"wrong": 0, "correct": 0})
+
+
+def record_answer(qid, is_correct):
+    progress = load_progress()
+    stat = progress["stats"].setdefault(qid, {"wrong": 0, "correct": 0})
+    if is_correct:
+        stat["correct"] += 1
+    else:
+        stat["wrong"] += 1
+    save_progress(progress)
+
+
+def build_weak_round(progress, size=WEAK_ROUND_SIZE):
+    """誤答フラグの多い問題ほど出やすくなるよう重み付けして出題セットを作る。
+    正答率が高くなった（マスター済みの）問題はプールから外す。"""
+    bank = progress["bank"]
+    stats = progress["stats"]
+
+    pool = []
+    weights = []
+    for qid in bank:
+        stat = stats.get(qid, {"wrong": 0, "correct": 0})
+        attempts = stat["wrong"] + stat["correct"]
+        if attempts >= MASTERED_MIN_ATTEMPTS and stat["correct"] / attempts >= MASTERED_ACCURACY:
+            continue
+        pool.append(qid)
+        weights.append(1 + stat["wrong"] * 2)
+
+    if not pool:  # 全問マスター済みなら、全問から出し直す
+        pool = list(bank.keys())
+        weights = [1] * len(pool)
+
+    picked = []
+    for _ in range(min(size, len(pool))):
+        chosen = random.choices(pool, weights=weights, k=1)[0]
+        i = pool.index(chosen)
+        picked.append(chosen)
+        pool.pop(i)
+        weights.pop(i)
+
+    questions = []
+    for qid in picked:
+        q = dict(bank[qid])
+        q["qid"] = qid
+        order = list(q["choices"].keys())
+        random.shuffle(order)
+        q["choice_order"] = order
+        questions.append(q)
     return questions
 
 
@@ -129,6 +231,7 @@ def load_and_shuffle_questions(raw):
 def init_state():
     defaults = {
         "questions": None,
+        "mode": "normal",    # normal | weak
         "index": 0,          # 0-indexed, 現在の問題番号
         "correct_count": 0,
         "answered": 0,
@@ -143,36 +246,118 @@ def init_state():
 
 
 def reset_quiz():
-    for k in ["questions", "index", "correct_count", "answered", "phase", "user_ans", "selected_radio", "history"]:
+    for k in ["questions", "mode", "index", "correct_count", "answered", "phase", "user_ans", "selected_radio", "history"]:
         if k in st.session_state:
             del st.session_state[k]
     init_state()
+    progress = load_progress()
+    progress["session"] = None
+    save_progress(progress)
 
 
-def try_autoload_default_questions():
-    """リポジトリ同梱の questions.txt があれば自動で読み込んですぐ出題開始する"""
+def start_quiz(questions, mode):
+    """出題セットとモードをセットして出題を開始し、再開用スナップショットを保存する"""
+    st.session_state.questions = questions
+    st.session_state.mode = mode
+    st.session_state.index = 0
+    st.session_state.correct_count = 0
+    st.session_state.answered = 0
+    st.session_state.history = []
+    st.session_state.phase = "question"
+    save_session_snapshot()
+
+
+def save_session_snapshot():
+    """進行中の出題セッションをディスクに保存し、画面リロード後も続きから再開できるようにする"""
+    if not st.session_state.get("questions"):
+        return
+    progress = load_progress()
+    progress["session"] = {
+        "mode": st.session_state.mode,
+        "qids": [{"qid": q["qid"], "choice_order": q["choice_order"]} for q in st.session_state.questions],
+        "index": st.session_state.index,
+        "correct_count": st.session_state.correct_count,
+        "answered": st.session_state.answered,
+        "history": st.session_state.history,
+        "phase": st.session_state.phase,
+    }
+    save_progress(progress)
+
+
+def try_resume_session():
+    """ディスクに進行中セッションがあれば復元する（画面リロード対策）"""
     if st.session_state.questions is not None:
         return
-    if not os.path.exists(DEFAULT_QUESTIONS_FILE):
+    progress = load_progress()
+    snap = progress.get("session")
+    if not snap:
         return
-    with open(DEFAULT_QUESTIONS_FILE, encoding="utf-8") as f:
-        raw = f.read()
-    questions = load_and_shuffle_questions(raw)
+    bank = progress["bank"]
+    try:
+        questions = []
+        for item in snap["qids"]:
+            q = dict(bank[item["qid"]])
+            q["qid"] = item["qid"]
+            q["choice_order"] = item["choice_order"]
+            questions.append(q)
+    except KeyError:
+        return
     if not questions:
         return
+
     st.session_state.questions = questions
-    st.session_state.phase = "question"
+    st.session_state.mode = snap.get("mode", "normal")
+    st.session_state.index = snap.get("index", 0)
+    st.session_state.correct_count = snap.get("correct_count", 0)
+    st.session_state.answered = snap.get("answered", 0)
+    st.session_state.history = snap.get("history", [])
+    st.session_state.phase = snap.get("phase", "question")
 
 
 init_state()
-try_autoload_default_questions()
+try_resume_session()
 
 
 # ─── 画面: アップロード ───────────────────────────────────────────────────
 
 def screen_upload():
     st.title("📝 1問1答クイズ")
+
+    progress = load_progress()
+    has_bank = len(progress["bank"]) > 0
+
+    mode = st.radio(
+        "モードを選択",
+        options=["normal", "weak"],
+        format_func=lambda m: "通常モード（全問出題）" if m == "normal" else "苦手克服モード（間違えやすい問題を優先出題）",
+    )
+
+    if mode == "weak":
+        if not has_bank:
+            st.info("苦手克服モードを使うには、まず通常モードで問題を解いて記録を作ってください。")
+            return
+
+        wrong_total = sum(1 for s in progress["stats"].values() if s["wrong"] > 0)
+        st.write(f"これまでの記録: {len(progress['bank'])}問中 {wrong_total}問で誤答あり。")
+        st.caption(f"誤答の多い問題を優先して、最大{WEAK_ROUND_SIZE}問を出題します。")
+
+        if st.button("苦手克服モードを開始", type="primary"):
+            questions = build_weak_round(progress)
+            start_quiz(questions, "weak")
+            st.rerun()
+        return
+
     st.write("問題ファイル（.txt）をアップロードしてください。")
+
+    if os.path.exists(DEFAULT_QUESTIONS_FILE) and st.button("同梱の問題で始める", type="primary"):
+        with open(DEFAULT_QUESTIONS_FILE, encoding="utf-8") as f:
+            raw = f.read()
+        questions = load_and_shuffle_questions(raw)
+        if not questions:
+            st.error("同梱の問題ファイルが読み込めませんでした。")
+        else:
+            start_quiz(questions, "normal")
+            st.rerun()
 
     uploaded = st.file_uploader("問題ファイルを選択", type=["txt"])
 
@@ -180,7 +365,7 @@ def screen_upload():
         try:
             raw = uploaded.read().decode("utf-8")
         except UnicodeDecodeError:
-            st.error("ファイルの文字コードを確認してください（UTF-8のテキストファイルを想定しています）。")
+            st.error("ファイルの文字コードを確認してください(UTF-8のテキストファイルを想定しています)。")
             return
 
         questions = load_and_shuffle_questions(raw)
@@ -189,8 +374,7 @@ def screen_upload():
             st.error("問題が読み込めませんでした。ファイルの形式を確認してください。")
             return
 
-        st.session_state.questions = questions
-        st.session_state.phase = "question"
+        start_quiz(questions, "normal")
         st.rerun()
 
     with st.expander("対応しているファイル形式を見る"):
@@ -243,7 +427,9 @@ def screen_question():
             "is_correct": is_correct,
             "explanation": q.get("explanation", ""),
         })
+        record_answer(q["qid"], is_correct)
         st.session_state.phase = "result"
+        save_session_snapshot()
         st.rerun()
 
 
@@ -282,6 +468,7 @@ def screen_result():
         else:
             st.session_state.index += 1
             st.session_state.phase = "question"
+        save_session_snapshot()
         st.rerun()
 
 
@@ -335,12 +522,7 @@ with st.sidebar:
         else:
             questions = load_and_shuffle_questions(raw)
             if questions:
-                st.session_state.questions = questions
-                st.session_state.index = 0
-                st.session_state.correct_count = 0
-                st.session_state.answered = 0
-                st.session_state.history = []
-                st.session_state.phase = "question"
+                start_quiz(questions, "normal")
                 st.rerun()
             else:
                 st.error("問題が読み込めませんでした。")
