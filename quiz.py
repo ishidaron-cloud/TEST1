@@ -12,7 +12,7 @@ DEFAULT_QUESTIONS_FILE = "questions.txt"
 
 # 苦手克服モード用の永続データ（誤答フラグ・進行中セッション）
 PROGRESS_FILE = "progress.json"
-WEAK_ROUND_SIZE = 30          # 苦手克服モードで一度に出題する問題数
+ROUND_SIZE = 30                # 通常モード・苦手克服モードで一度に出題する問題数
 MASTERED_MIN_ATTEMPTS = 3     # この回数以上解いていて
 MASTERED_ACCURACY = 0.9       # 正答率がこの値以上なら「マスター済み」として出題プールから外す
 
@@ -187,7 +187,7 @@ def record_answer(qid, is_correct):
     save_progress(progress)
 
 
-def build_weak_round(progress, size=WEAK_ROUND_SIZE):
+def build_weak_round(progress, size=ROUND_SIZE):
     """誤答フラグの多い問題ほど出やすくなるよう重み付けして出題セットを作る。
     正答率が高くなった（マスター済みの）問題はプールから外す。"""
     bank = progress["bank"]
@@ -329,7 +329,7 @@ def screen_upload():
     mode = st.radio(
         "モードを選択",
         options=["normal", "weak"],
-        format_func=lambda m: "通常モード（全問出題）" if m == "normal" else "苦手克服モード（間違えやすい問題を優先出題）",
+        format_func=lambda m: f"通常モード（{ROUND_SIZE}問ずつランダム出題）" if m == "normal" else "苦手克服モード（間違えやすい問題を優先出題）",
     )
 
     if mode == "weak":
@@ -339,7 +339,7 @@ def screen_upload():
 
         wrong_total = sum(1 for s in progress["stats"].values() if s["wrong"] > 0)
         st.write(f"これまでの記録: {len(progress['bank'])}問中 {wrong_total}問で誤答あり。")
-        st.caption(f"誤答の多い問題を優先して、最大{WEAK_ROUND_SIZE}問を出題します。")
+        st.caption(f"誤答の多い問題を優先して、最大{ROUND_SIZE}問を出題します。")
 
         if st.button("苦手克服モードを開始", type="primary"):
             questions = build_weak_round(progress)
@@ -348,6 +348,7 @@ def screen_upload():
         return
 
     st.write("問題ファイル（.txt）をアップロードしてください。")
+    st.caption(f"読み込んだ問題の中からランダムに{ROUND_SIZE}問を出題します（残りは苦手克服モードの母集団になります）。")
 
     if os.path.exists(DEFAULT_QUESTIONS_FILE) and st.button("同梱の問題で始める", type="primary"):
         with open(DEFAULT_QUESTIONS_FILE, encoding="utf-8") as f:
@@ -356,7 +357,7 @@ def screen_upload():
         if not questions:
             st.error("同梱の問題ファイルが読み込めませんでした。")
         else:
-            start_quiz(questions, "normal")
+            start_quiz(questions[:ROUND_SIZE], "normal")
             st.rerun()
 
     uploaded = st.file_uploader("問題ファイルを選択", type=["txt"])
@@ -374,7 +375,7 @@ def screen_upload():
             st.error("問題が読み込めませんでした。ファイルの形式を確認してください。")
             return
 
-        start_quiz(questions, "normal")
+        start_quiz(questions[:ROUND_SIZE], "normal")
         st.rerun()
 
     with st.expander("対応しているファイル形式を見る"):
@@ -522,7 +523,7 @@ with st.sidebar:
         else:
             questions = load_and_shuffle_questions(raw)
             if questions:
-                start_quiz(questions, "normal")
+                start_quiz(questions[:ROUND_SIZE], "normal")
                 st.rerun()
             else:
                 st.error("問題が読み込めませんでした。")
