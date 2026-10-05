@@ -195,8 +195,24 @@ def load_questions_from_text(raw):
     return parse_original_format(raw)
  
  
-def load_and_shuffle_questions(raw):
-    """テキストをパースし、出題順と選択肢の表示順をシャッフルする"""
+def text_hash(raw):
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+
+def read_default_file():
+    """同梱の問題ファイルを読む（無い・読めない場合は None）"""
+    if not os.path.exists(DEFAULT_QUESTIONS_FILE):
+        return None
+    try:
+        with open(DEFAULT_QUESTIONS_FILE, encoding="utf-8") as f:
+            return f.read()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def load_and_shuffle_questions(raw, kind, name):
+    """テキストをパースし、出題順と選択肢の表示順をシャッフルする。
+    kind は "default"（同梱ファイル）か "upload"（アップロード）、name は表示用のファイル名。"""
     questions = load_questions_from_text(raw)
     if not questions:
         return questions
@@ -206,11 +222,12 @@ def load_and_shuffle_questions(raw):
         order = list(q["choices"].keys())
         random.shuffle(order)
         q["choice_order"] = order
- 
+
+    # 出題プールは「今読み込んだファイル」の問題だけにする（過去のファイルの問題を残さない）
     progress = load_progress()
-    register_questions(progress, questions)
+    replace_bank(progress, questions, {"kind": kind, "name": name, "hash": text_hash(raw)})
     save_progress(progress)
- 
+
     return questions
  
  
@@ -258,6 +275,7 @@ def load_progress():
     data.setdefault("bank", {})
     data.setdefault("stats", {})
     data.setdefault("session", None)
+    data.setdefault("source", None)   # bank の元になった問題ファイルの情報
     return data
  
  
@@ -266,17 +284,42 @@ def save_progress(progress):
         json.dump(progress, f, ensure_ascii=False, indent=2)
  
  
-def register_questions(progress, questions):
-    """出題された問題を苦手データのバンクに登録する（既存の誤答記録は保持したまま）"""
-    for q in questions:
-        qid = q["qid"]
-        progress["bank"][qid] = {
+def replace_bank(progress, questions, source):
+    """バンク（出題プール）を、読み込んだファイルの問題だけに入れ替える。
+    以前のファイルの問題はバンクから消えるので、苦手克服モードや再開時に混ざらない。
+    正誤の記録(stats)は問題IDごとに残すので、同じ問題をまた読み込めば記録は引き継がれる。"""
+    progress["bank"] = {
+        q["qid"]: {
             "question": q["question"],
             "choices": q["choices"],
             "answer": q["answer"],
             "explanation": q.get("explanation", ""),
         }
+        for q in questions
+    }
+    for qid in progress["bank"]:
         progress["stats"].setdefault(qid, {"wrong": 0, "correct": 0})
+    progress["source"] = source
+    progress["session"] = None   # 前のファイルで進行中だったセッションは破棄する
+
+
+def sync_bank_with_default_file():
+    """同梱の問題ファイルが差し替えられていたら、古いファイル由来のバンクと進行中セッションを捨てて
+    新しいファイルの内容に入れ替える。（アップロードしたファイル由来のバンクはそのまま）"""
+    progress = load_progress()
+    if not progress["bank"] and not progress["session"]:
+        return
+    source = progress.get("source") or {}
+    if source.get("kind") == "upload":
+        return
+    raw = read_default_file()
+    if raw is None or source.get("hash") == text_hash(raw):
+        return
+    questions = load_questions_from_text(raw)
+    for q in questions:
+        q["qid"] = qid_for(q)
+    replace_bank(progress, questions, {"kind": "default", "name": DEFAULT_QUESTIONS_FILE, "hash": text_hash(raw)})
+    save_progress(progress)
  
  
 def record_answer(qid, is_correct):
@@ -420,6 +463,7 @@ def try_resume_session():
  
  
 init_state()
+sync_bank_with_default_file()
 try_resume_session()
  
  
@@ -442,7 +486,10 @@ def screen_upload():
             st.info("苦手克服モードを使うには、まず通常モードで問題を解いて記録を作ってください。")
             return
  
-        wrong_total = sum(1 for s in progress["stats"].values() if s["wrong"] > 0)
+        wrong_total = sum(1 for qid in progress["bank"] if progress["stats"].get(qid, {}).get("wrong", 0) > 0)
+        source_name = (progress.get("source") or {}).get("name")
+        if source_name:
+            st.caption(f"対象の問題ファイル: {source_name}")
         st.write(f"これまでの記録: {len(progress['bank'])}問中 {wrong_total}問で誤答あり。")
         st.caption(f"誤答の多い問題を優先して、最大{ROUND_SIZE}問を出題します。")
  
@@ -456,9 +503,8 @@ def screen_upload():
     st.caption(f"読み込んだ問題の中からランダムに{ROUND_SIZE}問を出題します（残りは苦手克服モードの母集団になります）。")
  
     if os.path.exists(DEFAULT_QUESTIONS_FILE) and st.button("同梱の問題で始める", type="primary"):
-        with open(DEFAULT_QUESTIONS_FILE, encoding="utf-8") as f:
-            raw = f.read()
-        questions = load_and_shuffle_questions(raw)
+        raw = read_default_file()
+        questions = load_and_shuffle_questions(raw, "default", DEFAULT_QUESTIONS_FILE) if raw else []
         if not questions:
             st.error("同梱の問題ファイルが読み込めませんでした。")
         else:
@@ -474,8 +520,8 @@ def screen_upload():
             st.error("ファイルの文字コードを確認してください(UTF-8のテキストファイルを想定しています)。")
             return
  
-        questions = load_and_shuffle_questions(raw)
- 
+        questions = load_and_shuffle_questions(raw, "upload", uploaded.name)
+
         if not questions:
             st.error("問題が読み込めませんでした。ファイルの形式を確認してください。")
             return
@@ -647,15 +693,24 @@ def screen_final():
 # ─── サイドバー: 別ファイルで試したいとき用 ──────────────────────────────
  
 with st.sidebar:
+    if st.session_state.phase != "upload":
+        if st.button("中断して最初の画面に戻る"):
+            reset_quiz()
+            st.rerun()
+
     st.markdown("### 別の問題ファイルで試す")
     override = st.file_uploader("問題ファイル(.txt)を差し替え", type=["txt"], key="override_uploader")
-    if override is not None:
+    if override is None:
+        st.session_state.pop("override_done", None)
+    # 同じファイルは1回だけ処理する（選択されたままだと毎回最初からやり直しになるため）
+    elif st.session_state.get("override_done") != hashlib.md5(override.getvalue()).hexdigest():
+        st.session_state.override_done = hashlib.md5(override.getvalue()).hexdigest()
         try:
-            raw = override.read().decode("utf-8")
+            raw = override.getvalue().decode("utf-8")
         except UnicodeDecodeError:
             st.error("ファイルの文字コードを確認してください（UTF-8のテキストファイルを想定しています）。")
         else:
-            questions = load_and_shuffle_questions(raw)
+            questions = load_and_shuffle_questions(raw, "upload", override.name)
             if questions:
                 start_quiz(questions[:ROUND_SIZE], "normal")
                 st.rerun()
